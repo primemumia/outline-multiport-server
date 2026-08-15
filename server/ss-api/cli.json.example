@@ -1,0 +1,9 @@
+{
+  "manager_address": "127.0.0.1:6001",
+  "server_ip": "SUNUCU.PUBLIC.IP",
+  "port_store": "/var/lib/shadowsocks-manager/ports.json",
+  "port_range": {
+    "start": 444,
+    "end": 999
+  }
+}

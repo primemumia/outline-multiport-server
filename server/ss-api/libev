@@ -1,0 +1,10 @@
+#!/bin/bash
+set -e
+SOURCE="${BASH_SOURCE[0]}"
+# Symlink uzerinden calistirildiginda gercek dizini bul (/usr/local/bin/libev -> /opt/ss-api/libev)
+if command -v readlink >/dev/null 2>&1; then
+    RESOLVED="$(readlink -f "${SOURCE}" 2>/dev/null || true)"
+    [[ -n "${RESOLVED}" ]] && SOURCE="${RESOLVED}"
+fi
+SCRIPT_DIR="$(cd "$(dirname "${SOURCE}")" && pwd)"
+exec python3 "${SCRIPT_DIR}/libev-cli.py" "$@"

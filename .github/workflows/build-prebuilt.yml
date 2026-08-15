@@ -1,0 +1,137 @@
+name: Build prebuilt binaries
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'server/shadowsocks-libev/**'
+      - 'server/build-wsl.sh'
+      - 'server/build-all.sh'
+      - 'server/install_scripts/install_server.sh'
+      - '.github/workflows/build-prebuilt.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            tag: ubuntu20.04
+            glibc_alias: glibc2.31
+            docker_image: 'ubuntu:20.04'
+          - runner: ubuntu-22.04
+            tag: ubuntu22.04
+            glibc_alias: glibc2.35
+            docker_image: ''
+          - runner: ubuntu-24.04
+            tag: ubuntu24.04
+            glibc_alias: glibc2.38
+            docker_image: ''
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (native)
+        if: matrix.docker_image == ''
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake pkg-config \
+            libev-dev libsodium-dev libpcre2-dev libc-ares-dev libmbedtls-dev
+          cmake -S server/shadowsocks-libev -B /tmp/libev-build \
+            -DCMAKE_BUILD_TYPE=Release -DWITH_STATIC=OFF
+          cmake --build /tmp/libev-build --target ss-server-shared ss-manager-shared -j"$(nproc)"
+          mkdir -p out
+          cp /tmp/libev-build/shared/bin/ss-server /tmp/libev-build/shared/bin/ss-manager out/
+
+      - name: Build (docker ${{ matrix.docker_image }})
+        if: matrix.docker_image != ''
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work/server/shadowsocks-libev \
+            "${{ matrix.docker_image }}" bash -lc '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq build-essential cmake pkg-config \
+                libev-dev libsodium-dev libpcre2-dev libc-ares-dev libmbedtls-dev
+              rm -rf /tmp/libev-build
+              cmake -S . -B /tmp/libev-build -DCMAKE_BUILD_TYPE=Release -DWITH_STATIC=OFF
+              cmake --build /tmp/libev-build --target ss-server-shared ss-manager-shared -j"$(nproc)"
+              mkdir -p /work/out
+              cp /tmp/libev-build/shared/bin/ss-server /tmp/libev-build/shared/bin/ss-manager /work/out/
+            '
+
+      - name: Stage binaries
+        run: |
+          mkdir -p "staging/${{ matrix.tag }}" "staging/${{ matrix.glibc_alias }}"
+          cp out/ss-server out/ss-manager "staging/${{ matrix.tag }}/"
+          cp out/ss-server out/ss-manager "staging/${{ matrix.glibc_alias }}/"
+          chmod 755 staging/${{ matrix.tag }}/* staging/${{ matrix.glibc_alias }}/*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.tag }}
+          path: staging/
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Install into repo tree
+        run: |
+          set -euo pipefail
+          echo "Artifact tree:"
+          find artifacts -type f | sort
+
+          install_pair() {
+            local src_dir="$1"
+            local dst_dir="$2"
+            mkdir -p "$dst_dir"
+            cp -f "${src_dir}/ss-server" "${src_dir}/ss-manager" "$dst_dir/"
+            chmod 755 "$dst_dir"/*
+          }
+
+          rm -rf server/bin/x86_64/ubuntu20.04 server/bin/x86_64/glibc2.31 \
+                 server/bin/x86_64/ubuntu22.04 server/bin/x86_64/glibc2.35 \
+                 server/bin/x86_64/ubuntu24.04 server/bin/x86_64/glibc2.38 \
+                 server/bin/x86_64/ss-server server/bin/x86_64/ss-manager
+
+          for tag in ubuntu20.04 glibc2.31 ubuntu22.04 glibc2.35 ubuntu24.04 glibc2.38; do
+            src="$(find artifacts -type d -name "$tag" 2>/dev/null | head -1)"
+            if [[ -z "$src" || ! -f "$src/ss-server" ]]; then
+              echo "ERROR: artifact bulunamadi: ${tag}"
+              find artifacts -maxdepth 4 -type d
+              exit 1
+            fi
+            install_pair "$src" "server/bin/x86_64/${tag}"
+          done
+
+          ls -laR server/bin/x86_64/
+
+      - name: Commit and push binaries
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server/bin/x86_64/
+          if git diff --staged --quiet; then
+            echo "No binary changes to commit."
+            exit 0
+          fi
+          git commit -m "ci: update prebuilt binaries (ubuntu20.04 + 22.04 + 24.04)"
+          git push

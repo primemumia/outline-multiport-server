@@ -1,0 +1,19 @@
+# Derleme ciktilari (kaynak icinde)
+server/shadowsocks-libev/build/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Telegram bot kurulum scripti (ayri proje — GitHub'a yuklenmez)
+out.sh
+
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Kurulum sirasinda olusan dosyalar (sunucuda)
+access.txt

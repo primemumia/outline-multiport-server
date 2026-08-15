@@ -1,0 +1,15 @@
+[Unit]
+Description=Shadowsocks Libev HTTP API (Outline compatible)
+After=network.target shadowsocks-manager.service
+Requires=shadowsocks-manager.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ss-api
+ExecStart=/usr/bin/python3 /opt/ss-api/ss_api.py --host 127.0.0.1 --port 8087 --manager-address 127.0.0.1:6001 --server-ip SERVER_IP --api-secret API_SECRET --port-store /var/lib/shadowsocks-manager/ports.json
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
