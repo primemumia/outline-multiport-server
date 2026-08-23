@@ -16,10 +16,10 @@
 #   LIBEV_PORT_START    Port havuzu baslangic (444)
 #   LIBEV_PORT_END      Port havuzu bitis (999)
 #   LIBEV_MULTI_PORT    Coklu cihaz portu (varsayilan: 443, IP kilidi yok)
-#   LIBEV_BOT_URL       Durum bildirimi icin bot adresi (or: https://bot.example.com)
 #   LIBEV_SERVER_NAME   Bildirimlerde gorunecek sunucu adi (istege bagli)
 #   TELECOM_TARGET       Erisim testi hedefi (varsayilan: https://telecom.tm)
 #   TELECOM_INTERVAL     Test araligi saniye (varsayilan: 60)
+#   TELECOM_STATUS_FILE  Gozcu durum dosyasi (API /server buradan okur)
 #
 # Bayraklar:
 #   --hostname HOST     Sunucu public IP veya domain
@@ -27,8 +27,8 @@
 #   --api-tls-port PORT Dis HTTPS API portu (varsayilan: 55555)
 #   LIBEV_API_TLS_PORT ortam degiskeni ile de ayarlanabilir
 #   --manager-port PORT (eski) UDP yerine unix socket kullanilir, yok sayilir
-#   --bot-url URL       telecom.tm durumunu bildirecek bot adresi
-#   --server-name NAME  Bot bildirimlerinde gorunecek sunucu adi
+#   --server-name NAME  API /server icinde gorunecek sunucu adi
+#   --bot-url URL       (eski, kullanilmaz; durum API uzerinden okunur)
 #   --local             GitHub yerine yerel server/ dizinini kullan (out.sh ile)
 #   -h, --help          Yardim
 
@@ -53,6 +53,7 @@ readonly SSL_DIR="/etc/libev/ssl"
 
 readonly TELECOM_TARGET="${TELECOM_TARGET:-https://telecom.tm}"
 readonly TELECOM_CONFIG="/etc/libev/telecom.json"
+readonly TELECOM_STATUS_FILE="${TELECOM_STATUS_FILE:-/etc/libev/telecom_status.json}"
 readonly TELECOM_WATCH_SCRIPT="${LIBEV_SS_API_DIR}/telecom_watch.py"
 readonly TELECOM_INTERVAL="${TELECOM_INTERVAL:-60}"
 
@@ -67,6 +68,7 @@ FLAGS_MANAGER_PORT=0
 FLAGS_LOCAL=0
 FLAGS_BOT_URL="${LIBEV_BOT_URL:-}"
 FLAGS_SERVER_NAME="${LIBEV_SERVER_NAME:-}"
+FLAGS_PATCH_TELECOM=0
 LIBEV_SOURCE_DIR="${LIBEV_SOURCE_DIR:-}"
 PREBUILT_BIN_DIR=""
 
@@ -122,7 +124,6 @@ Ornek (bot bildirimi ile):
 Ortam:
   LIBEV_REPO=primemumia/outline-multiport-server
   LIBEV_BRANCH=main
-  LIBEV_BOT_URL=https://bot.example.com
   TELECOM_TARGET=https://telecom.tm
   TELECOM_INTERVAL=60
 EOF
@@ -488,6 +489,106 @@ PYEOF
     echo "key_store.py coklu-port yamasi uygulandi (${LIBEV_MULTI_PORT})." >> "${FULL_LOG}"
 }
 
+function patch_ss_api_telecom_status() {
+    # ss_api.py: /server (ve /server-status) telecom.tm durumunu dosyadan okusun.
+    local api_py="${LIBEV_SS_API_DIR}/ss_api.py"
+    if [[ ! -f "${api_py}" ]]; then
+        echo "ss_api.py bulunamadi, telecom yamasi atlandi: ${api_py}" >> "${FULL_LOG}"
+        return 0
+    fi
+    API_PY="${api_py}" STATUS_FILE="${TELECOM_STATUS_FILE}" python3 - <<'PYEOF'
+import os
+
+path = os.environ["API_PY"]
+status_file = os.environ.get("STATUS_FILE") or "/etc/libev/telecom_status.json"
+with open(path, "r", encoding="utf-8") as fh:
+    src = fh.read()
+
+if "_read_telecom_status" in src:
+    print("ss_api.py telecom yamasi zaten var; atlaniyor.")
+    raise SystemExit(0)
+
+if "import os\n" not in src:
+    src = src.replace("import json\n", "import json\nimport os\n", 1)
+
+old = (
+    "    async def handle_server_info(self, request: web.Request) -> web.Response:\n"
+    "        await self._require_auth(request)\n"
+    "        return web.json_response(\n"
+    "            {\n"
+    '                "name": "shadowsocks-libev",\n'
+    '                "serverIp": self.keys.server_ip,\n'
+    '                "managerAddress": self.keys.client.manager_address,\n'
+    '                "method": DEFAULT_METHOD,\n'
+    "            }\n"
+    "        )\n"
+)
+new = (
+    "    def _read_telecom_status(self):\n"
+    "        path = os.environ.get(\"TELECOM_STATUS_FILE\", %r)\n"
+    "        try:\n"
+    "            with open(path, \"r\", encoding=\"utf-8\") as fh:\n"
+    "                data = json.load(fh)\n"
+    "        except Exception:\n"
+    "            return None\n"
+    "        if not isinstance(data, dict):\n"
+    "            return None\n"
+    "        status = data.get(\"status\")\n"
+    "        if status not in (\"online\", \"blocked\"):\n"
+    "            return None\n"
+    "        return {\n"
+    "            \"telecomStatus\": status,\n"
+    "            \"telecomHttpCode\": data.get(\"http_code\", 0),\n"
+    "            \"telecomTarget\": data.get(\"target\") or \"https://telecom.tm\",\n"
+    "            \"telecomDetail\": data.get(\"detail\") or \"\",\n"
+    "            \"telecomCheckedAt\": data.get(\"checked_at\") or 0,\n"
+    "            \"telecomServerName\": data.get(\"server_name\") or \"\",\n"
+    "        }\n"
+    "\n"
+    "    async def handle_server_info(self, request: web.Request) -> web.Response:\n"
+    "        await self._require_auth(request)\n"
+    "        payload = {\n"
+    "            \"name\": \"shadowsocks-libev\",\n"
+    "            \"serverIp\": self.keys.server_ip,\n"
+    "            \"managerAddress\": self.keys.client.manager_address,\n"
+    "            \"method\": DEFAULT_METHOD,\n"
+    "        }\n"
+    "        extra = self._read_telecom_status()\n"
+    "        if extra:\n"
+    "            payload.update(extra)\n"
+    "        return web.json_response(payload)\n"
+    "\n"
+    "    async def handle_telecom_status(self, request: web.Request) -> web.Response:\n"
+    "        await self._require_auth(request)\n"
+    "        extra = self._read_telecom_status()\n"
+    "        if not extra:\n"
+    "            return web.json_response({\"telecomStatus\": None}, status=200)\n"
+    "        return web.json_response(extra)\n"
+) % status_file
+if old not in src:
+    raise SystemExit("HATA: handle_server_info blogu bulunamadi (ss_api.py degismis olabilir)")
+src = src.replace(old, new, 1)
+
+old_route = (
+    "        app.router.add_get(f\"{secret}/server\", self.handle_server_info)\n"
+    "        return app\n"
+)
+new_route = (
+    "        app.router.add_get(f\"{secret}/server\", self.handle_server_info)\n"
+    "        app.router.add_get(f\"{secret}/server-status\", self.handle_telecom_status)\n"
+    "        return app\n"
+)
+if old_route not in src:
+    raise SystemExit("HATA: /server route bulunamadi (ss_api.py degismis olabilir)")
+src = src.replace(old_route, new_route, 1)
+
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(src)
+print("ss_api.py yamalandi (telecomStatus /server).")
+PYEOF
+    echo "ss_api.py telecom durum yamasi uygulandi (${TELECOM_STATUS_FILE})." >> "${FULL_LOG}"
+}
+
 function fetch_server_sources() {
     mkdir -p "${LIBEV_INSTALL_DIR}" "${LIBEV_WORKDIR}" "${LIBEV_SS_API_DIR}" /etc/libev
 
@@ -593,6 +694,7 @@ exec python3 ${LIBEV_SS_API_DIR}/libev-cli.py "\$@"
 EOF
     chmod +x /usr/local/bin/libev
     patch_ss_api_multi_port
+    patch_ss_api_telecom_status
 }
 
 function configure_system_limits() {
@@ -676,6 +778,7 @@ User=root
 LimitNOFILE=65535
 WorkingDirectory=${LIBEV_SS_API_DIR}
 Environment=LIBEV_MULTI_PORTS=${LIBEV_MULTI_PORT}
+Environment=TELECOM_STATUS_FILE=${TELECOM_STATUS_FILE}
 ExecStart=/usr/bin/python3 ${LIBEV_SS_API_DIR}/ss_api.py --host 127.0.0.1 --port ${API_PORT} --manager-address ${MANAGER_SOCKET} --server-ip ${PUBLIC_HOSTNAME} --api-secret ${LIBEV_API_SECRET} --port-store ${LIBEV_WORKDIR}/ports.json
 StandardOutput=null
 StandardError=journal
@@ -880,20 +983,20 @@ EOF
     chmod 600 "${ACCESS_CONFIG}"
 }
 
-function setup_telecom_watch() {
+function write_telecom_watch_script() {
     cat > "${TELECOM_WATCH_SCRIPT}" <<'PYEOF'
 #!/usr/bin/env python3
 """telecom.tm erisim gozcusu.
 
-Her calismada telecom.tm'e baglanmayi dener ve sonucu bota (POST /server-status)
-gonderir. Siniflandirma kurallari:
+Sonucu bota POST etmez. Durumu yerel JSON dosyasina yazar; ss-api
+GET /server (ve GET /server-status) bu dosyayi okur.
 
-  * Baglanti hic kurulamazsa (DNS hatasi, timeout, connection refused, TLS
-    handshake hatasi) -> status="blocked"  (Sunucu engellendi)
-  * Baglanti kurulup HERHANGI bir HTTP yaniti alinirsa (200/403/404/503 ...)
-    -> status="online"  (Sunucu calisiyor)
+Siniflandirma:
+  * Baglanti hic kurulamazsa -> status="blocked"
+  * HTTP yaniti alinirsa (200/403/404/503 ...) -> status="online"
 """
 import json
+import os
 import socket
 import ssl
 import sys
@@ -902,6 +1005,7 @@ import urllib.error
 import urllib.request
 
 DEFAULT_CONFIG = "/etc/libev/telecom.json"
+DEFAULT_STATUS = "/etc/libev/telecom_status.json"
 
 
 def load_config(path):
@@ -933,7 +1037,6 @@ def check_target(target):
             with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
                 return "online", getattr(resp, "status", 200), "ok"
         except urllib.error.HTTPError as exc:
-            # HTTP yaniti alindi => baglanti kuruldu => calisiyor
             return "online", exc.code, "http-error"
         except urllib.error.URLError as exc:
             last_detail = str(getattr(exc, "reason", exc))
@@ -947,26 +1050,18 @@ def check_target(target):
     return "blocked", 0, last_detail
 
 
-def post_status(bot_url, payload):
-    data = json.dumps(payload).encode("utf-8")
-    url = bot_url.rstrip("/") + "/server-status"
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "telecom-watch/1.0",
-        },
-    )
+def write_status(path, payload):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, path)
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return getattr(resp, "status", 0)
-    except urllib.error.HTTPError as exc:
-        return exc.code
-    except Exception as exc:  # noqa: BLE001
-        sys.stderr.write("bot POST hatasi: %s\n" % exc)
-        return -1
+        os.chmod(path, 0o644)
+    except OSError:
+        pass
 
 
 def main():
@@ -982,7 +1077,6 @@ def main():
 
     payload = {
         "server_ip": cfg.get("server_ip", ""),
-        "secret": cfg.get("api_secret", ""),
         "server_name": cfg.get("server_name", ""),
         "status": status,
         "http_code": http_code,
@@ -991,17 +1085,11 @@ def main():
         "checked_at": int(time.time()),
     }
 
-    bot_url = (cfg.get("bot_url") or "").strip()
-    if not bot_url:
-        sys.stdout.write(
-            "bot_url ayarli degil; sonuc: %s (%s)\n" % (status, detail)
-        )
-        return 0
-
-    code = post_status(bot_url, payload)
+    status_path = (cfg.get("status_file") or "").strip() or DEFAULT_STATUS
+    write_status(status_path, payload)
     sys.stdout.write(
-        "telecom=%s http=%s detail=%s -> bot=%s\n"
-        % (status, http_code, detail, code)
+        "telecom=%s http=%s detail=%s -> api=%s\n"
+        % (status, http_code, detail, status_path)
     )
     return 0
 
@@ -1010,14 +1098,17 @@ if __name__ == "__main__":
     sys.exit(main())
 PYEOF
     chmod 755 "${TELECOM_WATCH_SCRIPT}"
+}
+
+function setup_telecom_watch() {
+    write_telecom_watch_script
 
     cat > "${TELECOM_CONFIG}" <<EOF
 {
-  "bot_url": "${FLAGS_BOT_URL}",
   "server_ip": "${PUBLIC_HOSTNAME}",
   "server_name": "${FLAGS_SERVER_NAME}",
-  "api_secret": "${LIBEV_API_SECRET}",
-  "target": "${TELECOM_TARGET}"
+  "target": "${TELECOM_TARGET}",
+  "status_file": "${TELECOM_STATUS_FILE}"
 }
 EOF
     chmod 600 "${TELECOM_CONFIG}"
@@ -1050,12 +1141,7 @@ EOF
     systemctl daemon-reload
     systemctl enable telecom-watch.timer >/dev/null 2>&1
     systemctl restart telecom-watch.timer
-
-    if [[ -z "${FLAGS_BOT_URL}" ]]; then
-        echo "telecom gozcusu kuruldu ama --bot-url verilmedi; bildirim gonderilmeyecek." >> "${FULL_LOG}"
-    else
-        echo "telecom gozcusu ${TELECOM_INTERVAL}s araliginda ${FLAGS_BOT_URL}/server-status adresine bildiriyor." >> "${FULL_LOG}"
-    fi
+    echo "telecom gozcusu ${TELECOM_INTERVAL}s araliginda ${TELECOM_STATUS_FILE} yazar; bot GET /server ile okur." >> "${FULL_LOG}"
 }
 
 function output_install_result() {
@@ -1090,19 +1176,9 @@ Onemli:
 - VPN port araligi: ${LIBEV_PORT_START}-${LIBEV_PORT_END}/tcp+udp (tek cihaz, IP kilidi VAR)
 - Coklu cihaz portu: ${LIBEV_MULTI_PORT}/tcp+udp (IP kilidi YOK; bulut panelinde 443'u de acin)
 - nofile limiti: 65535 (ss-manager -n 65535)
-- telecom.tm gozcusu: her ${TELECOM_INTERVAL}s (systemctl status telecom-watch.timer)
+- telecom.tm gozcusu: her ${TELECOM_INTERVAL}s -> ${TELECOM_STATUS_FILE}
+- Bot bu durumu API'den okur: GET /server  (alan: telecomStatus)
 EOF
-
-    if [[ -n "${FLAGS_BOT_URL}" ]]; then
-        cat <<EOF
-- telecom durumu bildirilecek bot: ${FLAGS_BOT_URL}/server-status
-EOF
-    else
-        cat <<EOF
-- telecom bildirimi PASIF (--bot-url verilmedi). Etkinlestirmek icin:
-    ${TELECOM_CONFIG} icinde "bot_url" alanini doldurun.
-EOF
-    fi
 
     if [[ -n "${test_port}" ]]; then
         cat <<EOF
@@ -1167,6 +1243,10 @@ function parse_args() {
                 FLAGS_LOCAL=1
                 shift 1
                 ;;
+            --patch-telecom-api)
+                FLAGS_PATCH_TELECOM=1
+                shift 1
+                ;;
             -h|--help)
                 display_usage
                 exit 0
@@ -1180,9 +1260,54 @@ function parse_args() {
     done
 }
 
+function apply_telecom_api_only() {
+    require_root
+    mkdir -p /etc/libev "${LIBEV_SS_API_DIR}"
+    write_telecom_watch_script
+    patch_ss_api_telecom_status
+
+    python3 - <<PYEOF
+import json
+import os
+path = "${TELECOM_CONFIG}"
+status_file = "${TELECOM_STATUS_FILE}"
+cfg = {}
+if os.path.isfile(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh) or {}
+    except Exception:
+        cfg = {}
+cfg["status_file"] = status_file
+cfg.pop("bot_url", None)
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(cfg, fh, ensure_ascii=False, indent=2)
+    fh.write("\n")
+os.chmod(path, 0o600)
+print("telecom.json guncellendi: status_file=%s" % status_file)
+PYEOF
+
+    local unit="/etc/systemd/system/ss-api.service"
+    if [[ -f "${unit}" ]] && ! grep -q 'TELECOM_STATUS_FILE=' "${unit}"; then
+        sed -i "/Environment=LIBEV_MULTI_PORTS=/a Environment=TELECOM_STATUS_FILE=${TELECOM_STATUS_FILE}" "${unit}" \
+            || sed -i "/^\[Service\]/a Environment=TELECOM_STATUS_FILE=${TELECOM_STATUS_FILE}" "${unit}"
+    fi
+
+    systemctl daemon-reload
+    systemctl restart ss-api.service || true
+    python3 "${TELECOM_WATCH_SCRIPT}" "${TELECOM_CONFIG}" || true
+    systemctl restart telecom-watch.timer || true
+    echo "telecom durumu artik API GET /server (telecomStatus) uzerinden okunur."
+}
+
 function main() {
     trap finish EXIT
     parse_args "$@"
+
+    if (( FLAGS_PATCH_TELECOM == 1 )); then
+        apply_telecom_api_only
+        exit 0
+    fi
 
     require_root
 
