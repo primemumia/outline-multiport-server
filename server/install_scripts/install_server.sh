@@ -248,7 +248,7 @@ function detect_public_ip() {
         'https://ipinfo.io/ip'
         'https://domains.google.com/checkip'
     )
-    local ip
+    local ip url
     for url in "${urls[@]}"; do
         ip="$(fetch "${url}" | tr -d '[:space:]')" && [[ -n "${ip}" ]] && {
             PUBLIC_HOSTNAME="${ip}"
@@ -275,11 +275,11 @@ function install_dependencies() {
         python3 python3-pip curl ca-certificates tar \
         rsync nginx openssl libcap2-bin iproute2 \
         libev4 libpcre2-8-0 libc-ares2 libsodium23 libmbedcrypto7 \
-        2>/dev/null || apt_install \
+        2>>"${FULL_LOG}" || apt_install \
         python3 python3-pip curl ca-certificates tar \
         rsync nginx openssl libcap2-bin iproute2 \
         libev4 libpcre2-8-0 libc-ares2 libsodium23 libmbedtls14 \
-        2>/dev/null || apt_install \
+        2>>"${FULL_LOG}" || apt_install \
         python3 python3-pip curl ca-certificates tar \
         rsync nginx openssl libcap2-bin iproute2 \
         libev4 libpcre2-8-0 libc-ares2 libsodium23 libmbedcrypto3
@@ -609,7 +609,7 @@ function fetch_server_sources() {
         fi
         if [[ ! -d "${src_root}/ss-api" ]]; then
             log_error "Yerel ss-api bulunamadi: ${src_root}/ss-api"
-            exit 1
+            return 1
         fi
         if ! try_cache_prebuilt "${src_root}/bin/${MACHINE_TYPE}"; then
             log_error "Uyumlu prebuilt binary yok: ${src_root}/bin/${MACHINE_TYPE}/ (OS: $(detect_host_os_tag))"
@@ -642,7 +642,7 @@ function fetch_server_sources() {
     elif [[ ! -d "${clone_dir}/ss-api" ]]; then
         log_error "Repo yapisi hatali: ss-api bulunamadi (${LIBEV_REPO})"
         rm -rf "${clone_dir}"
-        exit 1
+        return 1
     fi
 
     if ! try_cache_prebuilt "${root}/bin/${MACHINE_TYPE}"; then
@@ -788,6 +788,8 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
+    # API secret'i dosyada tasidigi icin sadece root okuyabilsin
+    chmod 600 /etc/systemd/system/ss-api.service
 }
 
 function configure_firewall() {
@@ -836,14 +838,36 @@ EOF
 
     ln -sf /etc/nginx/sites-available/libev-api /etc/nginx/sites-enabled/libev-api
     rm -f /etc/nginx/sites-enabled/default
-    nginx -t >/dev/null 2>&1
+
+    local nginx_test
+    if ! nginx_test="$(nginx -t 2>&1)"; then
+        log_error "nginx yapilandirmasi gecersiz (libev-api):"
+        log_error "${nginx_test}"
+        return 1
+    fi
+
     systemctl enable nginx >/dev/null 2>&1
     if systemctl is-active --quiet nginx; then
-        systemctl reload nginx >/dev/null 2>&1
+        if ! systemctl reload nginx; then
+            log_error "nginx reload basarisiz. journalctl -u nginx -n 30 --no-pager"
+            return 1
+        fi
     else
-        systemctl start nginx >/dev/null 2>&1
+        if ! systemctl start nginx; then
+            log_error "nginx baslatilamadi. journalctl -u nginx -n 30 --no-pager"
+            return 1
+        fi
     fi
     configure_firewall
+}
+
+function verify_public_api() {
+    if curl -sfk --max-time 10 "https://127.0.0.1:${API_TLS_PORT}/${LIBEV_API_SECRET}/server" >/dev/null 2>&1; then
+        return 0
+    fi
+    log_error "Genel HTTPS API (nginx, port ${API_TLS_PORT}) yanit vermiyor."
+    log_error "Kontrol edin: systemctl status nginx / nginx -t / journalctl -u nginx -n 30"
+    return 1
 }
 
 function start_services() {
@@ -1148,7 +1172,7 @@ function output_install_result() {
     local outline_json test_port test_url
     outline_json="$(printf '{"apiUrl":"%s","certSha256":"%s"}' "${PUBLIC_API_URL}" "${CERT_SHA256}")"
 
-    read -r test_port test_url < <(python3 <<PYEOF 2>/dev/null || true
+    read -r test_port test_url < <(python3 <<PYEOF 2>>"${FULL_LOG}" || true
 import sys
 sys.path.insert(0, "${LIBEV_SS_API_DIR}")
 from key_store import KeyManager
@@ -1161,7 +1185,7 @@ else:
     payload = km.key_payload(port, entry)
     print(port, payload.get("accessUrl", ""))
 PYEOF
-)
+) || true
 
     cat <<EOF
 
@@ -1289,8 +1313,11 @@ PYEOF
 
     local unit="/etc/systemd/system/ss-api.service"
     if [[ -f "${unit}" ]] && ! grep -q 'TELECOM_STATUS_FILE=' "${unit}"; then
-        sed -i "/Environment=LIBEV_MULTI_PORTS=/a Environment=TELECOM_STATUS_FILE=${TELECOM_STATUS_FILE}" "${unit}" \
-            || sed -i "/^\[Service\]/a Environment=TELECOM_STATUS_FILE=${TELECOM_STATUS_FILE}" "${unit}"
+        if grep -q '^Environment=LIBEV_MULTI_PORTS=' "${unit}"; then
+            sed -i "/Environment=LIBEV_MULTI_PORTS=/a Environment=TELECOM_STATUS_FILE=${TELECOM_STATUS_FILE}" "${unit}"
+        else
+            sed -i "/^\[Service\]/a Environment=TELECOM_STATUS_FILE=${TELECOM_STATUS_FILE}" "${unit}"
+        fi
     fi
 
     systemctl daemon-reload
@@ -1341,8 +1368,8 @@ function main() {
     PUBLIC_HOSTNAME="${FLAGS_HOSTNAME}"
     if [[ -z "${PUBLIC_HOSTNAME}" ]]; then
         run_step "Public IP tespit ediliyor" detect_public_ip
+        refresh_server_ip
     fi
-    refresh_server_ip
     readonly PUBLIC_HOSTNAME
 
     echo "Tespit edilen OS: $(detect_host_os_tag) (glibc $(host_glibc_version))" >> "${FULL_LOG}"
@@ -1367,6 +1394,7 @@ function main() {
     run_step "Servisler baslatiliyor" start_services
     run_step "ss-manager bekleniyor" wait_for_manager
     run_step "API bekleniyor" wait_for_api
+    run_step "Genel HTTPS API dogrulaniyor" verify_public_api
     run_step "ss-manager portlari senkronize ediliyor" sync_manager_ports
     run_step "Ilk anahtar olusturuluyor" create_first_access_key
     run_step "VPN portu dogrulaniyor" verify_vpn_listening
