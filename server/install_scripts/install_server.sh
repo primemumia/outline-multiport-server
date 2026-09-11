@@ -178,11 +178,24 @@ function wait_for_apt_lock() {
 function disable_unattended_upgrades() {
     # apt.systemd.daily / unattended-upgrade dpkg kilidini uzun sure tutup
     # kurulumu takilmis gibi gosterebilir; kurulum oncesi durdurulur.
+    #
+    # ONEMLI: Bu script "bash -c \"\$(wget -qO- URL)\"" ile calistirildiginda
+    # tum script metni bash surecinin komut satirinda (cmdline) yer alir.
+    # "pkill -f unattended-upgrade" gibi genis bir desen, script metninde bu
+    # kelime gectigi icin script'in KENDI surecini de oldurebilir. Bu yuzden
+    # tam yurutulebilir yol kullanilir ve kendi PID'imiz acikca haric tutulur.
     systemctl stop \
         apt-daily.service apt-daily-upgrade.service \
         apt-daily.timer apt-daily-upgrade.timer \
         unattended-upgrades 2>/dev/null || true
-    pkill -KILL -f unattended-upgrade 2>/dev/null || true
+
+    local self_pid=$$
+    local pid
+    for pid in $(pgrep -f '/usr/bin/unattended-upgrade' 2>/dev/null); do
+        [[ "${pid}" == "${self_pid}" ]] && continue
+        kill -KILL "${pid}" 2>/dev/null || true
+    done
+
     dpkg --configure -a >/dev/null 2>&1 || true
     return 0
 }
