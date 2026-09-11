@@ -61,6 +61,10 @@ readonly TELECOM_INTERVAL="${TELECOM_INTERVAL:-60}"
 # LIBEV_PORT_START..LIBEV_PORT_END araligina (444-999) uygulanir.
 readonly LIBEV_MULTI_PORT="${LIBEV_MULTI_PORT:-443}"
 
+# archive.ubuntu.com/security.ubuntu.com bazi aglarda engelli/yavas olabilir;
+# bu mirror erisim testinden gecerse apt kaynaklari buna yonlendirilir.
+readonly APT_MIRROR_HOST="${LIBEV_APT_MIRROR:-mirror.yandex.ru}"
+
 FLAGS_HOSTNAME=""
 FLAGS_API_PORT=0
 FLAGS_API_TLS_PORT=0
@@ -150,16 +154,82 @@ function log_command() {
     return "${rc}"
 }
 
+function wait_for_apt_lock() {
+    # Taze acilan VPS'lerde unattended-upgrades/apt-daily dpkg kilidini tutabilir.
+    if ! command_exists fuser; then
+        return 0
+    fi
+    local -i waited=0
+    local -ir max_wait=90
+    while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock >/dev/null 2>&1; do
+        if (( waited == 0 )); then
+            echo "apt/dpkg kilidi baska bir islem tarafindan tutuluyor (unattended-upgrades olabilir), bekleniyor..." >> "${FULL_LOG}"
+        fi
+        if (( waited >= max_wait )); then
+            log_error "apt/dpkg kilidi ${max_wait}s sonra hala acik degil. Kontrol edin: ps aux | grep -E 'apt|dpkg|unattended'"
+            return 1
+        fi
+        sleep 3
+        waited+=3
+    done
+    return 0
+}
+
+function setup_apt_mirror() {
+    # archive.ubuntu.com/security.ubuntu.com bazi aglarda sessizce engelli
+    # olabilir (apt-get update sonsuza kadar takilir). Once alternatif mirror
+    # erisilebilir mi diye hizli test edilir; erisilebilirse apt kaynaklari
+    # buna yonlendirilir. Erisilemezse hicbir sey degistirilmez.
+    if ! curl --silent --show-error --fail --ipv4 --connect-timeout 5 --max-time 8 \
+        -o /dev/null "http://${APT_MIRROR_HOST}/ubuntu/"; then
+        echo "apt mirror ${APT_MIRROR_HOST} erisilemedi; varsayilan kaynaklar korunuyor." >> "${FULL_LOG}"
+        return 0
+    fi
+
+    local changed=0
+    local sources_deb822="/etc/apt/sources.list.d/ubuntu.sources"
+    local sources_list="/etc/apt/sources.list"
+    local target
+
+    for target in "${sources_deb822}" "${sources_list}"; do
+        [[ -f "${target}" ]] || continue
+        grep -q 'archive\.ubuntu\.com\|security\.ubuntu\.com' "${target}" 2>/dev/null || continue
+        cp -a "${target}" "${target}.bak.$(date +%s)" 2>/dev/null || true
+        sed -i \
+            -e "s#http://archive\.ubuntu\.com/ubuntu#http://${APT_MIRROR_HOST}/ubuntu#g" \
+            -e "s#https://archive\.ubuntu\.com/ubuntu#https://${APT_MIRROR_HOST}/ubuntu#g" \
+            -e "s#http://security\.ubuntu\.com/ubuntu#http://${APT_MIRROR_HOST}/ubuntu#g" \
+            -e "s#https://security\.ubuntu\.com/ubuntu#https://${APT_MIRROR_HOST}/ubuntu#g" \
+            "${target}"
+        changed=1
+    done
+
+    if (( changed == 1 )); then
+        echo "apt kaynaklari ${APT_MIRROR_HOST} mirror'una yonlendirildi." >> "${FULL_LOG}"
+    else
+        echo "apt kaynak dosyasinda archive/security.ubuntu.com bulunamadi; degistirilmedi." >> "${FULL_LOG}"
+    fi
+    return 0
+}
+
 function apt_update() {
-    apt-get update -qq </dev/null
+    wait_for_apt_lock || return 1
+    apt-get update -qq \
+        -o Acquire::http::Timeout=15 \
+        -o Acquire::https::Timeout=15 \
+        -o Acquire::Retries=2 </dev/null
 }
 
 function apt_install() {
+    wait_for_apt_lock || return 1
     apt-get install -qq -y \
         -o Dpkg::Use-Pty=0 \
         -o Dpkg::Progress-Fancy=0 \
         -o Dpkg::Options::=--force-confdef \
         -o Dpkg::Options::=--force-confold \
+        -o Acquire::http::Timeout=15 \
+        -o Acquire::https::Timeout=15 \
+        -o Acquire::Retries=2 \
         "$@" </dev/null
 }
 
@@ -190,7 +260,7 @@ function command_exists() {
 }
 
 function fetch() {
-    curl --silent --show-error --fail --ipv4 "$@"
+    curl --silent --show-error --fail --ipv4 --connect-timeout 8 --max-time 20 "$@"
 }
 
 function safe_base64() {
@@ -651,10 +721,11 @@ function fetch_server_sources() {
     archive_url="https://github.com/${LIBEV_REPO}/archive/refs/heads/${LIBEV_BRANCH}.tar.gz"
     echo "Repo arsivi indiriliyor: ${archive_url}" >> "${FULL_LOG}"
 
-    if ! curl --silent --show-error --fail --location --ipv4 "${archive_url}" \
+    if ! curl --silent --show-error --fail --location --ipv4 \
+        --connect-timeout 15 --max-time 180 --retry 2 --retry-delay 3 "${archive_url}" \
         | tar -xz -C "${clone_dir}" --strip-components=1 >> "${FULL_LOG}" 2>&1; then
         rm -rf "${clone_dir}"
-        log_error "Repo indirilemedi: ${archive_url}"
+        log_error "Repo indirilemedi (baglanti zaman asimina ugramis olabilir): ${archive_url}"
         return 1
     fi
 
@@ -1373,6 +1444,7 @@ PYEOF
 
 function main() {
     trap finish EXIT
+    echo "Canli kurulum logu: ${FULL_LOG}  (ayri bir oturumda: tail -f ${FULL_LOG})"
     parse_args "$@"
 
     if (( FLAGS_PATCH_TELECOM == 1 )); then
@@ -1381,6 +1453,8 @@ function main() {
     fi
 
     require_root
+
+    run_step "APT mirror kontrol ediliyor" setup_apt_mirror
 
     MACHINE_TYPE="$(uname -m)"
     if [[ "${MACHINE_TYPE}" != "x86_64" && "${MACHINE_TYPE}" != "aarch64" ]]; then
