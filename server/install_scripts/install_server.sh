@@ -17,7 +17,7 @@
 #   LIBEV_PORT_END      Port havuzu bitis (999)
 #   LIBEV_MULTI_PORT    Coklu cihaz portu (varsayilan: 443, IP kilidi yok)
 #   LIBEV_SERVER_NAME   Bildirimlerde gorunecek sunucu adi (istege bagli)
-#   TELECOM_TARGET       Erisim testi hedefi (varsayilan: https://telecom.tm)
+#   TELECOM_TARGETS      Virgulle ayrilmis uc erisim testi hedefi
 #   TELECOM_INTERVAL     Test araligi saniye (varsayilan: 60)
 #   TELECOM_STATUS_FILE  Gozcu durum dosyasi (API /server buradan okur)
 #
@@ -51,7 +51,7 @@ readonly LIBEV_PORT_END="${LIBEV_PORT_END:-999}"
 readonly MANAGER_SOCKET="${MANAGER_SOCKET:-${LIBEV_WORKDIR}/manager.sock}"
 readonly SSL_DIR="/etc/libev/ssl"
 
-readonly TELECOM_TARGET="${TELECOM_TARGET:-https://telecom.tm}"
+readonly TELECOM_TARGETS="${TELECOM_TARGETS:-https://telecom.tm,https://astu.tm,https://e.gov.tm}"
 readonly TELECOM_CONFIG="/etc/libev/telecom.json"
 readonly TELECOM_STATUS_FILE="${TELECOM_STATUS_FILE:-/etc/libev/telecom_status.json}"
 readonly TELECOM_WATCH_SCRIPT="${LIBEV_SS_API_DIR}/telecom_watch.py"
@@ -124,7 +124,7 @@ Ornek (bot bildirimi ile):
 Ortam:
   LIBEV_REPO=primemumia/outline-multiport-server
   LIBEV_BRANCH=main
-  TELECOM_TARGET=https://telecom.tm
+    TELECOM_TARGETS=https://telecom.tm,https://astu.tm,https://e.gov.tm
   TELECOM_INTERVAL=60
 EOF
 }
@@ -505,7 +505,26 @@ with open(path, "r", encoding="utf-8") as fh:
     src = fh.read()
 
 if "_read_telecom_status" in src:
-    print("ss_api.py telecom yamasi zaten var; atlaniyor.")
+    if "telecomAttemptResults" in src:
+        print("ss_api.py telecom yamasi zaten guncel; atlaniyor.")
+        raise SystemExit(0)
+    old_status_fields = (
+        '            "telecomServerName": data.get("server_name") or "",\n'
+        "        }\n"
+    )
+    new_status_fields = (
+        '            "telecomServerName": data.get("server_name") or "",\n'
+        '            "telecomAttemptResults": data.get("attempt_results") or [],\n'
+        '            "telecomSuccessfulAttempts": data.get("successful_attempts", 0),\n'
+        '            "telecomFailedAttempts": data.get("failed_attempts", 0),\n'
+        "        }\n"
+    )
+    if old_status_fields not in src:
+        raise SystemExit("HATA: Eski telecom API yamasi guncellenemedi")
+    src = src.replace(old_status_fields, new_status_fields, 1)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(src)
+    print("ss_api.py telecom yamasi uc deneme alanlariyla guncellendi.")
     raise SystemExit(0)
 
 if "import os\n" not in src:
@@ -543,6 +562,9 @@ new = (
     "            \"telecomDetail\": data.get(\"detail\") or \"\",\n"
     "            \"telecomCheckedAt\": data.get(\"checked_at\") or 0,\n"
     "            \"telecomServerName\": data.get(\"server_name\") or \"\",\n"
+    "            \"telecomAttemptResults\": data.get(\"attempt_results\") or [],\n"
+    "            \"telecomSuccessfulAttempts\": data.get(\"successful_attempts\", 0),\n"
+    "            \"telecomFailedAttempts\": data.get(\"failed_attempts\", 0),\n"
     "        }\n"
     "\n"
     "    async def handle_server_info(self, request: web.Request) -> web.Response:\n"
@@ -1027,6 +1049,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 DEFAULT_CONFIG = "/etc/libev/telecom.json"
 DEFAULT_STATUS = "/etc/libev/telecom_status.json"
@@ -1043,35 +1066,46 @@ def check_target(target):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
-    if target.startswith("https://"):
-        candidates = [target, "http://" + target[len("https://"):]]
-    elif target.startswith("http://"):
-        candidates = [target, "https://" + target[len("http://"):]]
-    else:
-        candidates = ["https://" + target, "http://" + target]
+    url = target if target.startswith(("https://", "http://")) else "https://" + target
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={"User-Agent": "telecom-watch/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+            return "online", getattr(resp, "status", 200), "ok"
+    except urllib.error.HTTPError as exc:
+        return "online", exc.code, "http-error"
+    except urllib.error.URLError as exc:
+        return "blocked", 0, str(getattr(exc, "reason", exc))
+    except (socket.timeout, TimeoutError):
+        return "blocked", 0, "timeout"
+    except Exception as exc:  # noqa: BLE001
+        return "blocked", 0, str(exc)
 
-    last_detail = "baglanti kurulamadi"
-    for url in candidates:
-        req = urllib.request.Request(
-            url,
-            method="GET",
-            headers={"User-Agent": "telecom-watch/1.0"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
-                return "online", getattr(resp, "status", 200), "ok"
-        except urllib.error.HTTPError as exc:
-            return "online", exc.code, "http-error"
-        except urllib.error.URLError as exc:
-            last_detail = str(getattr(exc, "reason", exc))
-            continue
-        except (socket.timeout, TimeoutError):
-            last_detail = "timeout"
-            continue
-        except Exception as exc:  # noqa: BLE001
-            last_detail = str(exc)
-            continue
-    return "blocked", 0, last_detail
+
+def check_targets_parallel(targets):
+    """Uc farkli hedefi uc paralel baglanti ile dene ve raporla."""
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        checks = list(executor.map(check_target, targets))
+
+    attempts = [
+        {
+            "target": target,
+            "ok": status == "online",
+            "http_code": http_code,
+            "detail": detail,
+        }
+        for target, (status, http_code, detail) in zip(targets, checks)
+    ]
+    successful = sum(1 for attempt in attempts if attempt["ok"])
+    failed = len(attempts) - successful
+    # Tek bir baglanti bile kurulursa sunucu erisilebilir kabul edilir.
+    status = "online" if successful else "blocked"
+    http_code = next((item["http_code"] for item in attempts if item["ok"]), 0)
+    detail = "; ".join(item["detail"] for item in attempts if item["detail"])
+    return status, http_code, detail, attempts, successful, failed
 
 
 def write_status(path, payload):
@@ -1096,24 +1130,34 @@ def main():
         sys.stderr.write("config okunamadi (%s): %s\n" % (cfg_path, exc))
         return 1
 
-    target = cfg.get("target") or "https://telecom.tm"
-    status, http_code, detail = check_target(target)
+    targets = cfg.get("targets") or [
+        "https://telecom.tm", "https://astu.tm", "https://e.gov.tm"
+    ]
+    if not isinstance(targets, list):
+        targets = [str(targets)]
+    targets = [str(target).strip() for target in targets if str(target).strip()][:3]
+    if len(targets) != 3:
+        targets = ["https://telecom.tm", "https://astu.tm", "https://e.gov.tm"]
+    status, http_code, detail, attempts, successful, failed = check_targets_parallel(targets)
 
     payload = {
         "server_ip": cfg.get("server_ip", ""),
         "server_name": cfg.get("server_name", ""),
         "status": status,
         "http_code": http_code,
-        "target": target,
+        "target": ", ".join(targets),
         "detail": detail,
         "checked_at": int(time.time()),
+        "attempt_results": attempts,
+        "successful_attempts": successful,
+        "failed_attempts": failed,
     }
 
     status_path = (cfg.get("status_file") or "").strip() or DEFAULT_STATUS
     write_status(status_path, payload)
     sys.stdout.write(
-        "telecom=%s http=%s detail=%s -> api=%s\n"
-        % (status, http_code, detail, status_path)
+        "telecom=%s ok=%s false=%s http=%s detail=%s -> api=%s\n"
+        % (status, successful, failed, http_code, detail, status_path)
     )
     return 0
 
@@ -1131,7 +1175,7 @@ function setup_telecom_watch() {
 {
   "server_ip": "${PUBLIC_HOSTNAME}",
   "server_name": "${FLAGS_SERVER_NAME}",
-  "target": "${TELECOM_TARGET}",
+    "targets": ["https://telecom.tm", "https://astu.tm", "https://e.gov.tm"],
   "status_file": "${TELECOM_STATUS_FILE}"
 }
 EOF
@@ -1165,7 +1209,7 @@ EOF
     systemctl daemon-reload
     systemctl enable telecom-watch.timer >/dev/null 2>&1
     systemctl restart telecom-watch.timer
-    echo "telecom gozcusu ${TELECOM_INTERVAL}s araliginda ${TELECOM_STATUS_FILE} yazar; bot GET /server ile okur." >> "${FULL_LOG}"
+    echo "telecom gozcusu ${TELECOM_INTERVAL}s araliginda telecom.tm, astu.tm ve e.gov.tm adreslerini paralel test eder; bot GET /server ile okur." >> "${FULL_LOG}"
 }
 
 function output_install_result() {
@@ -1200,7 +1244,7 @@ Onemli:
 - VPN port araligi: ${LIBEV_PORT_START}-${LIBEV_PORT_END}/tcp+udp (tek cihaz, IP kilidi VAR)
 - Coklu cihaz portu: ${LIBEV_MULTI_PORT}/tcp+udp (IP kilidi YOK; bulut panelinde 443'u de acin)
 - nofile limiti: 65535 (ss-manager -n 65535)
-- telecom.tm gozcusu: her ${TELECOM_INTERVAL}s -> ${TELECOM_STATUS_FILE}
+- telecom/astu/e.gov.tm gozcusu: her ${TELECOM_INTERVAL}s -> ${TELECOM_STATUS_FILE}
 - Bot bu durumu API'den okur: GET /server  (alan: telecomStatus)
 EOF
 
