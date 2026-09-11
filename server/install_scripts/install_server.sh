@@ -175,6 +175,18 @@ function wait_for_apt_lock() {
     return 0
 }
 
+function disable_unattended_upgrades() {
+    # apt.systemd.daily / unattended-upgrade dpkg kilidini uzun sure tutup
+    # kurulumu takilmis gibi gosterebilir; kurulum oncesi durdurulur.
+    systemctl stop \
+        apt-daily.service apt-daily-upgrade.service \
+        apt-daily.timer apt-daily-upgrade.timer \
+        unattended-upgrades 2>/dev/null || true
+    pkill -KILL -f unattended-upgrade 2>/dev/null || true
+    dpkg --configure -a >/dev/null 2>&1 || true
+    return 0
+}
+
 function setup_apt_mirror() {
     # archive.ubuntu.com/security.ubuntu.com bazi aglarda sessizce engelli
     # olabilir (apt-get update sonsuza kadar takilir). Once alternatif mirror
@@ -190,11 +202,13 @@ function setup_apt_mirror() {
     local sources_deb822="/etc/apt/sources.list.d/ubuntu.sources"
     local sources_list="/etc/apt/sources.list"
     local target
+    local backup_dir="/etc/libev/apt-source-backups"
 
     for target in "${sources_deb822}" "${sources_list}"; do
         [[ -f "${target}" ]] || continue
         grep -q 'archive\.ubuntu\.com\|security\.ubuntu\.com' "${target}" 2>/dev/null || continue
-        cp -a "${target}" "${target}.bak.$(date +%s)" 2>/dev/null || true
+        mkdir -p "${backup_dir}"
+        cp -a "${target}" "${backup_dir}/$(basename "${target}").bak.$(date +%s)" 2>/dev/null || true
         sed -i \
             -e "s#http://archive\.ubuntu\.com/ubuntu#http://${APT_MIRROR_HOST}/ubuntu#g" \
             -e "s#https://archive\.ubuntu\.com/ubuntu#https://${APT_MIRROR_HOST}/ubuntu#g" \
@@ -1454,6 +1468,7 @@ function main() {
 
     require_root
 
+    run_step "Otomatik guncellemeler durduruluyor" disable_unattended_upgrades
     run_step "APT mirror kontrol ediliyor" setup_apt_mirror
 
     MACHINE_TYPE="$(uname -m)"
