@@ -205,8 +205,16 @@ function setup_apt_mirror() {
     # olabilir (apt-get update sonsuza kadar takilir). Once alternatif mirror
     # erisilebilir mi diye hizli test edilir; erisilebilirse apt kaynaklari
     # buna yonlendirilir. Erisilemezse hicbir sey degistirilmez.
-    if ! curl --silent --show-error --fail --ipv4 --connect-timeout 5 --max-time 8 \
-        -o /dev/null "http://${APT_MIRROR_HOST}/ubuntu/"; then
+    # Ana sayfa yerine gercek bir InRelease dosyasi indirilir: mirror bazi
+    # bolgelerden ana sayfayi verip paket indirmelerinde zaman asimina ugrar.
+    local codename=""
+    codename="$(. /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-}")"
+    if [[ -z "${codename}" ]]; then
+        echo "Ubuntu kod adi bulunamadi; varsayilan kaynaklar korunuyor." >> "${FULL_LOG}"
+        return 0
+    fi
+    if ! curl --silent --show-error --fail --ipv4 --connect-timeout 5 --max-time 15 \
+        -o /dev/null "http://${APT_MIRROR_HOST}/ubuntu/dists/${codename}-updates/InRelease"; then
         echo "apt mirror ${APT_MIRROR_HOST} erisilemedi; varsayilan kaynaklar korunuyor." >> "${FULL_LOG}"
         return 0
     fi
@@ -239,12 +247,46 @@ function setup_apt_mirror() {
     return 0
 }
 
+function restore_apt_sources() {
+    # setup_apt_mirror'in aldigi en eski (orijinal) yedekleri geri yukler.
+    local backup_dir="/etc/libev/apt-source-backups"
+    local name bak restored=1
+    [[ -d "${backup_dir}" ]] || return 1
+    for name in ubuntu.sources sources.list; do
+        bak="$(ls -1 "${backup_dir}/${name}.bak."* 2>/dev/null | sort | head -1 || true)"
+        [[ -n "${bak}" ]] || continue
+        if [[ "${name}" == "ubuntu.sources" ]]; then
+            cp -a "${bak}" "/etc/apt/sources.list.d/${name}" && restored=0
+        else
+            cp -a "${bak}" "/etc/apt/${name}" && restored=0
+        fi
+    done
+    return "${restored}"
+}
+
 function apt_update() {
     wait_for_apt_lock || return 1
-    apt-get update -qq \
-        -o Acquire::http::Timeout=15 \
-        -o Acquire::https::Timeout=15 \
-        -o Acquire::Retries=2 </dev/null
+    local -a opts=(
+        -o Acquire::ForceIPv4=true
+        -o Acquire::http::Timeout=15
+        -o Acquire::https::Timeout=15
+        -o Acquire::Retries=2
+    )
+    # apt-get update, indirme hatalarinda bile 0 donebilir (sadece "W:" uyarisi);
+    # bu yuzden cikti da kontrol edilir.
+    local out rc=0
+    out="$(apt-get update "${opts[@]}" </dev/null 2>&1)" || rc=$?
+    printf '%s\n' "${out}"
+    if (( rc == 0 )) && ! grep -Eq '^(Err:|W: Failed to fetch|E:)' <<<"${out}"; then
+        return 0
+    fi
+    # Mirror kaynakli hata olabilir: orijinal kaynaklara donup tekrar dene.
+    if restore_apt_sources; then
+        echo "apt update basarisiz; orijinal apt kaynaklari geri yuklendi, tekrar deneniyor." >> "${FULL_LOG}"
+        apt-get update "${opts[@]}" </dev/null
+        return $?
+    fi
+    return $(( rc == 0 ? 1 : rc ))
 }
 
 function apt_install() {
@@ -254,6 +296,7 @@ function apt_install() {
         -o Dpkg::Progress-Fancy=0 \
         -o Dpkg::Options::=--force-confdef \
         -o Dpkg::Options::=--force-confold \
+        -o Acquire::ForceIPv4=true \
         -o Acquire::http::Timeout=15 \
         -o Acquire::https::Timeout=15 \
         -o Acquire::Retries=2 \
