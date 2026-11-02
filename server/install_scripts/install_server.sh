@@ -351,7 +351,7 @@ function load_existing_api_secret() {
         fi
     fi
     if [[ -f /etc/systemd/system/ss-api.service ]]; then
-        secret="$(sed -n 's/.*--api-secret \([^[:space:]]*\).*/\1/p' /etc/systemd/system/ss-api.service | head -1)"
+        secret="$(sed -n 's/.*--api-secret[ =]\([^[:space:]]*\).*/\1/p' /etc/systemd/system/ss-api.service | head -1)"
         if [[ -n "${secret}" ]]; then
             echo "${secret}"
             return 0
@@ -371,7 +371,11 @@ function generate_api_secret() {
         readonly LIBEV_API_SECRET
         return 0
     fi
+    # '-' ile baslayan secret argparse'ta seceneke benzer; harfle baslat.
     LIBEV_API_SECRET="$(head -c 24 /dev/urandom | safe_base64)"
+    while [[ "${LIBEV_API_SECRET}" == -* ]]; do
+        LIBEV_API_SECRET="$(head -c 24 /dev/urandom | safe_base64)"
+    done
     readonly LIBEV_API_SECRET
 }
 
@@ -942,7 +946,7 @@ LimitNOFILE=65535
 WorkingDirectory=${LIBEV_SS_API_DIR}
 Environment=LIBEV_MULTI_PORTS=${LIBEV_MULTI_PORT}
 Environment=TELECOM_STATUS_FILE=${TELECOM_STATUS_FILE}
-ExecStart=/usr/bin/python3 ${LIBEV_SS_API_DIR}/ss_api.py --host 127.0.0.1 --port ${API_PORT} --manager-address ${MANAGER_SOCKET} --server-ip ${PUBLIC_HOSTNAME} --api-secret ${LIBEV_API_SECRET} --port-store ${LIBEV_WORKDIR}/ports.json
+ExecStart=/usr/bin/python3 ${LIBEV_SS_API_DIR}/ss_api.py --host 127.0.0.1 --port ${API_PORT} --manager-address ${MANAGER_SOCKET} --server-ip ${PUBLIC_HOSTNAME} --api-secret=${LIBEV_API_SECRET} --port-store ${LIBEV_WORKDIR}/ports.json
 StandardOutput=null
 StandardError=journal
 Restart=on-failure
@@ -1085,14 +1089,25 @@ PYEOF
 }
 
 function wait_for_api() {
+    # ss_api.py acilista kayitli tum portlari ss-manager'a yukler ve bu bitene
+    # kadar dinlemeye baslamaz; cok anahtarli yeniden kurulumlarda uzun surebilir.
     local -i i
-    for i in $(seq 1 30); do
+    for i in $(seq 1 120); do
         if curl -sf "http://127.0.0.1:${API_PORT}/${LIBEV_API_SECRET}/server" >/dev/null 2>&1; then
             return 0
         fi
+        if (( i > 5 )) && systemctl is-failed --quiet ss-api; then
+            break
+        fi
         sleep 1
     done
-    log_error "ss-api hazir degil (port ${API_PORT})"
+    {
+        echo "--- systemctl status ss-api ---"
+        systemctl status ss-api --no-pager -l 2>&1 | tail -15
+        echo "--- journalctl -u ss-api ---"
+        journalctl -u ss-api -n 40 --no-pager 2>&1
+    } >> "${FULL_LOG}" 2>&1 || true
+    log_error "ss-api hazir degil (port ${API_PORT}). Ayrinti: journalctl -u ss-api -n 40 --no-pager"
     return 1
 }
 
