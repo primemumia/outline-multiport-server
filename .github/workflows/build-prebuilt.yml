@@ -32,6 +32,10 @@ jobs:
             tag: ubuntu24.04
             glibc_alias: glibc2.38
             docker_image: ''
+          - runner: ubuntu-latest
+            tag: ubuntu26.04
+            glibc_alias: glibc2.43
+            docker_image: 'ubuntu:26.04'
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -110,9 +114,10 @@ jobs:
           rm -rf server/bin/x86_64/ubuntu20.04 server/bin/x86_64/glibc2.31 \
                  server/bin/x86_64/ubuntu22.04 server/bin/x86_64/glibc2.35 \
                  server/bin/x86_64/ubuntu24.04 server/bin/x86_64/glibc2.38 \
+                 server/bin/x86_64/ubuntu26.04 server/bin/x86_64/glibc2.43 \
                  server/bin/x86_64/ss-server server/bin/x86_64/ss-manager
 
-          for tag in ubuntu20.04 glibc2.31 ubuntu22.04 glibc2.35 ubuntu24.04 glibc2.38; do
+          for tag in ubuntu20.04 glibc2.31 ubuntu22.04 glibc2.35 ubuntu24.04 glibc2.38 ubuntu26.04 glibc2.43; do
             src="$(find artifacts -type d -name "$tag" 2>/dev/null | head -1)"
             if [[ -z "$src" || ! -f "$src/ss-server" ]]; then
               echo "ERROR: artifact bulunamadi: ${tag}"
@@ -133,5 +138,5 @@ jobs:
             echo "No binary changes to commit."
             exit 0
           fi
-          git commit -m "ci: update prebuilt binaries (ubuntu20.04 + 22.04 + 24.04)"
+          git commit -m "ci: update prebuilt binaries (ubuntu20.04 + 22.04 + 24.04 + 26.04)"
           git push

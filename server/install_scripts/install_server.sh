@@ -418,15 +418,26 @@ function install_dependencies() {
     apt_install \
         python3 python3-pip curl ca-certificates tar \
         rsync nginx openssl libcap2-bin iproute2 \
-        libev4 libpcre2-8-0 libc-ares2 libsodium23 libmbedcrypto7 \
-        2>>"${FULL_LOG}" || apt_install \
-        python3 python3-pip curl ca-certificates tar \
-        rsync nginx openssl libcap2-bin iproute2 \
-        libev4 libpcre2-8-0 libc-ares2 libsodium23 libmbedtls14 \
-        2>>"${FULL_LOG}" || apt_install \
-        python3 python3-pip curl ca-certificates tar \
-        rsync nginx openssl libcap2-bin iproute2 \
-        libev4 libpcre2-8-0 libc-ares2 libsodium23 libmbedcrypto3
+        libev4 libpcre2-8-0 libc-ares2 libsodium23
+
+    # mbedTLS paket adi Ubuntu surumune gore degisir (ornek: 20.04 libmbedcrypto3,
+    # 22.04/24.04 libmbedcrypto7, 26.04 libmbedcrypto16). Hangisi depoda varsa o
+    # kurulur; ss-server'in gercekten ihtiyac duydugu surum install_shadowsocks_binaries
+    # icindeki ldd kontroluyle dogrulanir.
+    local pkg installed=0
+    for pkg in libmbedcrypto16 libmbedcrypto7 libmbedcrypto7t64 libmbedcrypto3; do
+        if apt-cache show "${pkg}" >/dev/null 2>&1; then
+            if apt_install "${pkg}"; then
+                installed=1
+                echo "mbedTLS paketi kuruldu: ${pkg}" >> "${FULL_LOG}"
+                break
+            fi
+        fi
+    done
+    if (( installed == 0 )); then
+        echo "UYARI: uygun libmbedcrypto paketi depoda bulunamadi." >> "${FULL_LOG}"
+    fi
+    return 0
 }
 
 function host_glibc_version() {
@@ -523,21 +534,25 @@ function binary_is_compatible() {
     [[ -x "${bin}" ]] || return 1
     ldd_out="$(ldd "${bin}" 2>&1)" || true
     if echo "${ldd_out}" | grep -q "not found"; then
+        echo "ldd eksik kutuphane (${bin}): $(echo "${ldd_out}" | grep 'not found' | tr -s '[:space:]' ' ')" >> "${FULL_LOG}"
         return 1
     fi
     return 0
 }
 
 function verify_binary_deps() {
-    local missing
-    missing="$(ldd /usr/local/bin/ss-manager 2>/dev/null | grep 'not found' || true)"
+    local missing="" bin out
+    for bin in /usr/local/bin/ss-server /usr/local/bin/ss-manager; do
+        out="$(ldd "${bin}" 2>/dev/null | grep 'not found' || true)"
+        [[ -n "${out}" ]] && missing+="${bin}:${out}"$'\n'
+    done
     if [[ -n "${missing}" ]]; then
-        log_error "ss-manager kutuphane eksik:${missing}"
+        log_error "Binary kutuphane eksik:"$'\n'"${missing}"
         if echo "${missing}" | grep -q 'GLIBC_'; then
             log_error "Prebuilt binary sunucu glibc surumu ile uyumsuz (sunucu: $(host_glibc_version))."
             log_error "Repo icine bu Ubuntu icin ss-server/ss-manager koyun: bin/${MACHINE_TYPE}/ubuntuXX.04/"
         else
-            log_error "apt install libev4 libpcre2-8-0 libc-ares2 libsodium23 libmbedcrypto7"
+            log_error "Kurulu kutuphaneler bu binary icin yeterli degil: $(detect_host_os_tag) icin derlenmis binary gerekli."
         fi
         return 1
     fi
@@ -565,7 +580,7 @@ function try_cache_prebuilt() {
         fi
         seen="${seen} ${candidate}"
         if [[ -f "${candidate}/ss-server" && -f "${candidate}/ss-manager" ]]; then
-            if binary_is_compatible "${candidate}/ss-manager"; then
+            if binary_is_compatible "${candidate}/ss-server" && binary_is_compatible "${candidate}/ss-manager"; then
                 echo "Uyumlu prebuilt: ${candidate}" >> "${FULL_LOG}"
                 cache_prebuilt_from_dir "${candidate}"
                 return 0
